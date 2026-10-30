@@ -153,6 +153,11 @@ _UNSUPPORTED_VALUE_PATTERNS = (
 )
 # The error category recorded for such a refusal; the acceptance gate types it as ``invalid_request_parameter``.
 INVALID_REQUEST_PARAMETER_CATEGORY = "invalid_request_parameter"
+# The output-token limit has a different name on each API. Chat accepts two, and vLLM prefers
+# max_completion_tokens when both arrive; /v1/completions reads max_tokens; Responses reads max_output_tokens.
+_CHAT_TOKEN_LIMIT_KEYS = ("max_completion_tokens", "max_tokens")
+_TOKEN_LIMIT_KEYS = (*_CHAT_TOKEN_LIMIT_KEYS, "max_output_tokens")
+_TOKEN_LIMIT_KEY_BY_API = {"completions": "max_tokens", "responses": "max_output_tokens"}
 
 
 def _names_context_window(message: str) -> bool:
@@ -942,6 +947,19 @@ class VLLMModel(SimpleResponsesAPIModel):
                 self.config.name,
                 self.config.sampling_overrides,
             )
+            pinned_limits = [
+                (key, self.config.sampling_overrides[key])
+                for key in _TOKEN_LIMIT_KEYS
+                if key in self.config.sampling_overrides
+            ]
+            if any(value != pinned_limits[0][1] for _, value in pinned_limits[1:]):
+                LOG.warning(
+                    "`%s` pins the output-token limit to different values under different names %s; "
+                    "every endpoint sends %s=%s",
+                    self.config.name,
+                    dict(pinned_limits),
+                    *pinned_limits[0],
+                )
 
         self._clients = [
             NeMoGymAsyncOpenAI(
@@ -1082,7 +1100,9 @@ class VLLMModel(SimpleResponsesAPIModel):
             response.metadata = {**(response.metadata or {}), "nemo_gym_context_window_exceeded": "true"}
         return response
 
-    def _apply_sampling_overrides(self, body_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def _apply_sampling_overrides(
+        self, body_dict: Dict[str, Any], *, api: Literal["chat", "completions", "responses"] = "chat"
+    ) -> Dict[str, Any]:
         """Force ``config.sampling_overrides`` onto an outbound body, in place.
 
         Applied last at every site that builds a request for the engine, so the pinned values win
@@ -1090,9 +1110,26 @@ class VLLMModel(SimpleResponsesAPIModel):
         the client sent nothing. Every path has to call this: a harness picks its own endpoint, and
         a pin that covers only one of them yields off-policy generation while reporting that
         sampling is pinned.
+
+        A pinned output-token limit replaces the request's limit under every name and is sent under
+        the name the ``api`` endpoint reads. Otherwise a request that names the limit differently
+        from the pin reaches the engine with both, and the engine may read the request's. A pin that
+        names the limit more than once sends the value of the first name in ``_TOKEN_LIMIT_KEYS``
+        order on every endpoint, so one config caps a run alike whichever endpoint serves it.
         """
-        if self.config.sampling_overrides:
-            body_dict.update(self.config.sampling_overrides)
+        if not self.config.sampling_overrides:
+            return body_dict
+        overrides = dict(self.config.sampling_overrides)
+        pinned_limits = {key: overrides.pop(key) for key in _TOKEN_LIMIT_KEYS if key in overrides}
+        body_dict.update(overrides)
+        if pinned_limits:
+            for key in _TOKEN_LIMIT_KEYS:
+                body_dict.pop(key, None)
+            if api == "chat":
+                limit_key = next((key for key in _CHAT_TOKEN_LIMIT_KEYS if key in pinned_limits), "max_tokens")
+            else:
+                limit_key = _TOKEN_LIMIT_KEY_BY_API[api]
+            body_dict[limit_key] = next(iter(pinned_limits.values()))
         return body_dict
 
     async def _responses_native(
@@ -1118,7 +1155,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             body_dict["chat_template_kwargs"] = deepcopy(self.config.chat_template_kwargs)
         if self.config.extra_body:
             body_dict = self.config.extra_body | body_dict
-        self._apply_sampling_overrides(body_dict)
+        self._apply_sampling_overrides(body_dict, api="responses")
 
         note_generation_request(body_dict)
         client = self._resolve_client(request)
@@ -1348,6 +1385,10 @@ class VLLMModel(SimpleResponsesAPIModel):
                     raise NotImplementedError
 
         if extra_body:
+            if any(body_dict.get(key) is not None for key in _CHAT_TOKEN_LIMIT_KEYS):
+                # The request body's limit wins under either name. An extra_body limit under the other
+                # name would otherwise reach the engine too, and vLLM reads max_completion_tokens first.
+                extra_body = {key: value for key, value in extra_body.items() if key not in _CHAT_TOKEN_LIMIT_KEYS}
             body_dict = extra_body | body_dict
 
         self._splice_audio_from_metadata(body_dict, metadata)
@@ -2268,6 +2309,12 @@ class VLLMModel(SimpleResponsesAPIModel):
         # request-level fields.
         if self.config.extra_body:
             extra_body = deepcopy(self.config.extra_body)
+            # /v1/completions reads only max_tokens and ignores max_completion_tokens, falling back to
+            # its own default of 16 tokens. Rename a chat-spelled default so it applies. A request
+            # limit still wins, because the request body is merged over the defaults.
+            default_limit = extra_body.pop("max_completion_tokens", None)
+            if default_limit is not None:
+                extra_body.setdefault("max_tokens", default_limit)
             out = extra_body | out
 
         if self.config.return_token_id_information:
@@ -2280,7 +2327,7 @@ class VLLMModel(SimpleResponsesAPIModel):
         # chat_completions() branches here before preprocessing, so the pin has to be applied again.
         # vLLM accepts the same sampling field names on /v1/completions, and the body is forwarded as raw JSON,
         # so params without a first-class OpenAI completion field (top_k, min_p) pass through.
-        return self._apply_sampling_overrides(out)
+        return self._apply_sampling_overrides(out, api="completions")
 
     def _completion_dict_to_chat_completion(self, completion_dict: Dict[str, Any]) -> NeMoGymChatCompletion:
         """Wrap a /v1/completions response as a NeMoGymChatCompletion.
