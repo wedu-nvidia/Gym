@@ -381,12 +381,14 @@ async def test_a_forwarded_gym_failure_stays_the_cause_and_no_attempt_is_added(m
 
 async def test_a_recovered_response_timeout_keeps_its_confirmed_upload_observation(monkeypatch):
     calls = 0
+    first_attempt_released = asyncio.Event()
 
     async def endpoint(request):
         nonlocal calls
         calls += 1
         if calls == 1:
-            await asyncio.sleep(0.08)
+            # Hold the first attempt until the retry has answered, so only it times out, however slow the runner.
+            await first_attempt_released.wait()
         return web.json_response({})
 
     app = web.Application()
@@ -395,7 +397,7 @@ async def test_a_recovered_response_timeout_keeps_its_confirmed_upload_observati
         monkeypatch.setattr(http_client, "get_global_aiohttp_client", lambda: session)
         monkeypatch.setattr(http_client, "is_span_group_enabled", lambda _: False)
         model = NeMoGymAsyncOpenAI(
-            api_key="test", base_url=str(server.make_url("/")), max_connection_retries=2, request_timeout_seconds=0.04
+            api_key="test", base_url=str(server.make_url("/")), max_connection_retries=2, request_timeout_seconds=0.5
         )
         with RequestFailureLog.capture() as log:
             response = await model._request(
@@ -404,6 +406,7 @@ async def test_a_recovered_response_timeout_keeps_its_confirmed_upload_observati
             assert response.status == 200
             await response.read()
             report = log.reply_report(None)
+        first_attempt_released.set()
     assert calls == 2 and report.failure_id is None
     [attempt] = report.events.values()
     assert attempt.details.request_upload_complete is True
